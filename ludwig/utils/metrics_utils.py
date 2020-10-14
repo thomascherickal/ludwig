@@ -14,17 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
 from collections import OrderedDict
 
 import numpy as np
 from sklearn import metrics
 from sklearn.metrics import confusion_matrix
-
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +43,8 @@ class ConfusionMatrix:
             self.idx2label = {idx: str(label) for idx, label in
                               enumerate(np.unique(
                                   [self.predictions, self.conditions]))}
-        self.cm = confusion_matrix(self.predictions,
-                                   self.conditions,
+        self.cm = confusion_matrix(self.conditions,
+                                   self.predictions,
                                    labels=labels,
                                    sample_weight=sample_weight)
 
@@ -207,7 +202,8 @@ class ConfusionMatrix:
                                 average=average)
 
     def avg_fbeta_score(self, beta, average='macro'):
-        return metrics.fbeta_score(self.conditions, self.predictions, beta=beta,
+        return metrics.fbeta_score(self.conditions, self.predictions,
+                                   beta=beta,
                                    average=average)
 
     def kappa_score(self):
@@ -301,7 +297,7 @@ def average_precision_score(conditions, prediction_scores, average='micro',
 #     args = parser.parse_args()
 #
 #     hdf5_data = h5py.File(args.gold_standard, 'r')
-#     split = hdf5_data['split'].value
+#     split = hdf5_data[SPLIT].value
 #     column = hdf5_data['macros'].value
 #     hdf5_data.close()
 #     conditions = column[split == 2]  # ground truth

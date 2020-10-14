@@ -17,33 +17,27 @@
 import logging
 import os
 import sys
+from functools import partial
+from multiprocessing import Pool
 
 import h5py
 import numpy as np
 import tensorflow as tf
 
-from functools import partial
-from multiprocessing import Pool
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.encoders.image_encoders import Stacked2DCNN, ResNetEncoder
 from ludwig.features.base_feature import InputFeature
-from ludwig.models.modules.image_encoders import ResNetEncoder
-from ludwig.models.modules.image_encoders import Stacked2DCNN
 from ludwig.utils.data_utils import get_abs_path
 from ludwig.utils.image_utils import greyscale
 from ludwig.utils.image_utils import num_channels_in_image
 from ludwig.utils.image_utils import resize_image
-from ludwig.utils.misc import get_from_registry
-from ludwig.utils.misc import set_default_value
+from ludwig.utils.misc_utils import set_default_value
 
 logger = logging.getLogger(__name__)
 
 
-class ImageBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = IMAGE
-
+class ImageFeatureMixin(object):
+    type = IMAGE
     preprocessing_defaults = {
         'missing_value_strategy': BACKFILL,
         'in_memory': True,
@@ -146,7 +140,7 @@ class ImageBaseFeature(BaseFeature):
                 "or explicit image width and height are expected"
                 "to be provided. "
                 "Additional information: "
-                "https://uber.github.io/ludwig/user_guide/#image-features-preprocessing"
+                "https://ludwig-ai.github.io/ludwig-docs/user_guide/#image-features-preprocessing"
                     .format([img_height, img_width, num_channels], img.shape)
             )
 
@@ -154,8 +148,8 @@ class ImageBaseFeature(BaseFeature):
 
     @staticmethod
     def _finalize_preprocessing_parameters(
-        preprocessing_parameters,
-        first_image_path
+            preprocessing_parameters,
+            first_image_path
     ):
         """
         Helper method to determine the height, width and number of channels for
@@ -206,7 +200,7 @@ class ImageBaseFeature(BaseFeature):
             width = first_img_width
 
         if NUM_CHANNELS in preprocessing_parameters:
-            # User specified num_channels in the model/feature definition
+            # User specified num_channels in the model/feature config
             user_specified_num_channels = True
             num_channels = preprocessing_parameters[NUM_CHANNELS]
         else:
@@ -230,7 +224,7 @@ class ImageBaseFeature(BaseFeature):
     def add_feature_data(
             feature,
             dataset_df,
-            data,
+            dataset,
             metadata,
             preprocessing_parameters
     ):
@@ -244,19 +238,20 @@ class ImageBaseFeature(BaseFeature):
             'num_processes',
             preprocessing_parameters['num_processes']
         )
-        csv_path = None
-        if hasattr(dataset_df, 'csv'):
-            csv_path = os.path.dirname(os.path.abspath(dataset_df.csv))
+        src_path = None
+        if hasattr(dataset_df, 'src'):
+            src_path = os.path.dirname(os.path.abspath(dataset_df.src))
 
         num_images = len(dataset_df)
         if num_images == 0:
             raise ValueError('There are no images in the dataset provided.')
 
-        first_image_path = dataset_df[feature['name']][0]
-        if csv_path is None and not os.path.isabs(first_image_path):
+        first_path = next(iter(dataset_df[feature[NAME]]))
+
+        if src_path is None and not os.path.isabs(first_path):
             raise ValueError('Image file paths must be absolute')
 
-        first_image_path = get_abs_path(csv_path, first_image_path)
+        first_path = get_abs_path(src_path, first_path)
 
         (
             should_resize,
@@ -265,17 +260,17 @@ class ImageBaseFeature(BaseFeature):
             num_channels,
             user_specified_num_channels,
             first_image
-        ) = ImageBaseFeature._finalize_preprocessing_parameters(
-            preprocessing_parameters, first_image_path
+        ) = ImageFeatureMixin._finalize_preprocessing_parameters(
+            preprocessing_parameters, first_path
         )
 
-        metadata[feature['name']]['preprocessing']['height'] = height
-        metadata[feature['name']]['preprocessing']['width'] = width
-        metadata[feature['name']]['preprocessing'][
+        metadata[feature[NAME]]['preprocessing']['height'] = height
+        metadata[feature[NAME]]['preprocessing']['width'] = width
+        metadata[feature[NAME]]['preprocessing'][
             'num_channels'] = num_channels
 
         read_image_and_resize = partial(
-            ImageBaseFeature._read_image_and_resize,
+            ImageFeatureMixin._read_image_and_resize,
             img_width=width,
             img_height=height,
             should_resize=should_resize,
@@ -283,16 +278,16 @@ class ImageBaseFeature(BaseFeature):
             resize_method=preprocessing_parameters['resize_method'],
             user_specified_num_channels=user_specified_num_channels
         )
-        all_file_paths = [get_abs_path(csv_path, file_path)
-                          for file_path in dataset_df[feature['name']]]
+        all_file_paths = [get_abs_path(src_path, file_path)
+                          for file_path in dataset_df[feature[NAME]]]
 
         if feature['preprocessing']['in_memory']:
             # Number of processes to run in parallel for preprocessing
             num_processes = feature['preprocessing']['num_processes']
-            metadata[feature['name']]['preprocessing'][
+            metadata[feature[NAME]]['preprocessing'][
                 'num_processes'] = num_processes
 
-            data[feature['name']] = np.empty(
+            dataset[feature[NAME]] = np.empty(
                 (num_images, height, width, num_channels),
                 dtype=np.uint8
             )
@@ -301,32 +296,33 @@ class ImageBaseFeature(BaseFeature):
             # standard code anyway.
             if num_processes > 1 or num_images > 1:
                 with Pool(num_processes) as pool:
-                    logger.warning(
+                    logger.debug(
                         'Using {} processes for preprocessing images'.format(
                             num_processes
                         )
                     )
-                    data[feature['name']] = np.array(
+                    dataset[feature[NAME]] = np.array(
                         pool.map(read_image_and_resize, all_file_paths)
                     )
-            # If we're not running multiple processes and we are only processing one
-            # image just use this faster shortcut, bypassing multiprocessing.Pool.map
+
             else:
-                logger.warning(
-                        'No process pool initialized. Using one process for preprocessing images'
+                # If we're not running multiple processes and we are only processing one
+                # image just use this faster shortcut, bypassing multiprocessing.Pool.map
+                logger.debug(
+                    'No process pool initialized. Using one process for preprocessing images'
                 )
                 img = read_image_and_resize(all_file_paths[0])
-                data[feature['name']] = np.array([img])
+                dataset[feature[NAME]] = np.array([img])
         else:
-            data_fp = os.path.splitext(dataset_df.csv)[0] + '.hdf5'
+            data_fp = os.path.splitext(dataset_df.src)[0] + '.hdf5'
             mode = 'w'
             if os.path.isfile(data_fp):
                 mode = 'r+'
 
             with h5py.File(data_fp, mode) as h5_file:
-                # TODO add multiprocessing/multithreading
+                # todo future add multiprocessing/multithreading
                 image_dataset = h5_file.create_dataset(
-                    feature['name'] + '_data',
+                    feature[NAME] + '_data',
                     (num_images, height, width, num_channels),
                     dtype=np.uint8
                 )
@@ -334,76 +330,47 @@ class ImageBaseFeature(BaseFeature):
                     image_dataset[i, :height, :width, :] = (
                         read_image_and_resize(filepath)
                     )
+                h5_file.flush()
 
-            data[feature['name']] = np.arange(num_images)
+            dataset[feature[NAME]] = np.arange(num_images)
 
 
-class ImageInputFeature(ImageBaseFeature, InputFeature):
-    def __init__(self, feature):
+class ImageInputFeature(ImageFeatureMixin, InputFeature):
+    height = 0
+    width = 0
+    num_channels = 0
+    scaling = 'pixel_normalization'
+    encoder = 'stacked_cnn'
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        self.height = 0
-        self.width = 0
-        self.num_channels = 0
-        self.scaling = 'pixel_normalization'
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype == tf.uint8
 
-        self.encoder = 'stacked_cnn'
+        # csting and rescaling
+        inputs = tf.cast(inputs, tf.float32) / 255
 
-        encoder_parameters = self.overwrite_defaults(feature)
-
-        self.encoder_obj = self.get_image_encoder(encoder_parameters)
-
-    def get_image_encoder(self, encoder_parameters):
-        return get_from_registry(
-            self.encoder, image_encoder_registry)(
-            **encoder_parameters
+        inputs_encoded = self.encoder_obj(
+            inputs, training=training, mask=mask
         )
 
-    def _get_input_placeholder(self):
-        # None dimension is for dealing with variable batch size
-        return tf.compat.v1.placeholder(
-            tf.float32,
-            shape=[None, self.height, self.width, self.num_channels],
-            name=self.name,
-        )
+        return inputs_encoded
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logger.debug('  placeholder: {0}'.format(placeholder))
+    def get_input_dtype(self):
+        return tf.uint8
 
-        scaled = get_from_registry(
-            self.scaling,
-            image_scaling_registry
-        )(placeholder)
-        logger.debug('  scaled: {0}'.format(scaled))
-
-        feature_representation, feature_representation_size = self.encoder_obj(
-            placeholder,
-            regularizer,
-            dropout_rate,
-            is_training,
-        )
-        logger.debug(
-            '  feature_representation: {0}'.format(feature_representation)
-        )
-
-        feature_representation = {
-            'name': self.name,
-            'type': self.type,
-            'representation': feature_representation,
-            'size': feature_representation_size,
-            'placeholder': placeholder
-        }
-        return feature_representation
+    def get_input_shape(self):
+        return self.height, self.width, self.num_channels
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
@@ -414,14 +381,15 @@ class ImageInputFeature(ImageBaseFeature, InputFeature):
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
         set_default_value(input_feature, 'preprocessing', {})
 
+    encoder_registry = {
+        'stacked_cnn': Stacked2DCNN,
+        'resnet': ResNetEncoder,
+        None: Stacked2DCNN
+    }
 
-image_encoder_registry = {
-    'stacked_cnn': Stacked2DCNN,
-    'resnet': ResNetEncoder
-}
 
 image_scaling_registry = {
     'pixel_normalization': lambda x: x * 1.0 / 255,

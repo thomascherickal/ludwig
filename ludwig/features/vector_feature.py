@@ -16,35 +16,32 @@
 # ==============================================================================
 import logging
 import os
-from collections import OrderedDict
 
 import numpy as np
 import tensorflow as tf
-from ludwig.models.modules.initializer_modules import get_initializer
+from tensorflow.keras.metrics import \
+    MeanAbsoluteError as MeanAbsoluteErrorMetric
+from tensorflow.keras.metrics import MeanSquaredError as MeanSquaredErrorMetric
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.decoders.generic_decoders import Projector
+from ludwig.encoders.generic_encoders import PassthroughEncoder, \
+    DenseEncoder
 from ludwig.features.base_feature import InputFeature
 from ludwig.features.base_feature import OutputFeature
-from ludwig.models.modules.dense_encoders import Dense
-from ludwig.models.modules.loss_modules import weighted_softmax_cross_entropy
-from ludwig.models.modules.measure_modules import \
-    absolute_error as get_absolute_error
-from ludwig.models.modules.measure_modules import error as get_error
-from ludwig.models.modules.measure_modules import r2 as get_r2
-from ludwig.models.modules.measure_modules import \
-    squared_error as get_squared_error
-from ludwig.utils.misc import get_from_registry
-from ludwig.utils.misc import set_default_value
+from ludwig.modules.loss_modules import SoftmaxCrossEntropyLoss, MSELoss, \
+    MAELoss
+from ludwig.modules.metric_modules import ErrorScore, \
+    SoftmaxCrossEntropyMetric, MSEMetric, MAEMetric
+from ludwig.modules.metric_modules import R2Score
+from ludwig.utils.horovod_utils import is_on_master
+from ludwig.utils.misc_utils import set_default_value
 
 logger = logging.getLogger(__name__)
 
 
-class VectorBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = VECTOR
-
+class VectorFeatureMixin(object):
+    type = VECTOR
     preprocessing_defaults = {
         'missing_value_strategy': FILL_WITH_CONST,
         'fill_value': ""
@@ -60,21 +57,22 @@ class VectorBaseFeature(BaseFeature):
     def add_feature_data(
             feature,
             dataset_df,
-            data,
+            dataset,
             metadata,
-            preprocessing_parameters
+            preprocessing_parameters,
     ):
         """
-        Expects all the vectors to be of the same size. The vectors need to be
-        whitespace delimited strings. Missing values are not handled.
-        """
+                Expects all the vectors to be of the same size. The vectors need to be
+                whitespace delimited strings. Missing values are not handled.
+                """
         if len(dataset_df) == 0:
             raise ValueError("There are no vectors in the dataset provided")
 
         # Convert the string of features into a numpy array
         try:
-            data[feature['name']] = np.array(
-                [x.split() for x in dataset_df[feature['name']]], dtype=np.double
+            dataset[feature[NAME]] = np.array(
+                [x.split() for x in dataset_df[feature[NAME]]],
+                dtype=np.float32
             )
         except ValueError:
             logger.error(
@@ -84,7 +82,7 @@ class VectorBaseFeature(BaseFeature):
             raise
 
         # Determine vector size
-        vector_size = len(data[feature['name']][0])
+        vector_size = len(dataset[feature[NAME]][0])
         if 'vector_size' in preprocessing_parameters:
             if vector_size != preprocessing_parameters['vector_size']:
                 raise ValueError(
@@ -94,67 +92,41 @@ class VectorBaseFeature(BaseFeature):
                     )
                 )
         else:
-            logger.warning('Observed vector size: {}'.format(vector_size))
+            logger.debug('Observed vector size: {}'.format(vector_size))
 
-        metadata[feature['name']]['vector_size'] = vector_size
+        metadata[feature[NAME]]['vector_size'] = vector_size
 
 
-class VectorInputFeature(VectorBaseFeature, InputFeature):
-    def __init__(self, feature):
+class VectorInputFeature(VectorFeatureMixin, InputFeature):
+    encoder = 'dense'
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        self.vector_size = 0
-        self.encoder = 'fc_stack'
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype == tf.float32 or inputs.dtype == tf.float64
+        assert len(inputs.shape) == 2
 
-        encoder_parameters = self.overwrite_defaults(feature)
-
-        self.encoder_obj = self.get_vector_encoder(encoder_parameters)
-
-    def get_vector_encoder(self, encoder_parameters):
-        return get_from_registry(self.encoder, vector_encoder_registry)(
-            **encoder_parameters
+        inputs_encoded = self.encoder_obj(
+            inputs, training=training, mask=mask
         )
 
-    def _get_input_placeholder(self):
-        # None dimension is for dealing with variable batch size
-        return tf.compat.v1.placeholder(
-            tf.float32,
-            shape=[None, self.vector_size],
-            name=self.name,
-        )
+        return inputs_encoded
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logger.debug('  placeholder: {0}'.format(placeholder))
+    def get_input_dtype(self):
+        return tf.float32
 
-        feature_representation, feature_representation_size = self.encoder_obj(
-            placeholder,
-            self.vector_size,
-            regularizer,
-            dropout_rate,
-            is_training=is_training
-        )
-        logger.debug(
-            '  feature_representation: {0}'.format(feature_representation)
-        )
-
-        feature_representation = {
-            'name': self.name,
-            'type': self.type,
-            'representation': feature_representation,
-            'size': feature_representation_size,
-            'placeholder': placeholder
-        }
-        return feature_representation
+    def get_input_shape(self):
+        return self.vector_size,
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
@@ -165,267 +137,126 @@ class VectorInputFeature(VectorBaseFeature, InputFeature):
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
         set_default_value(input_feature, 'preprocessing', {})
 
+    encoder_registry = {
+        'dense': DenseEncoder,
+        'passthrough': PassthroughEncoder,
+        'null': PassthroughEncoder,
+        'none': PassthroughEncoder,
+        'None': PassthroughEncoder,
+        None: PassthroughEncoder
+    }
 
-class VectorOutputFeature(VectorBaseFeature, OutputFeature):
+
+class VectorOutputFeature(VectorFeatureMixin, OutputFeature):
+    decoder = 'projector'
+    loss = {TYPE: MEAN_SQUARED_ERROR}
+    metric_functions = {LOSS: None, ERROR: None, MEAN_SQUARED_ERROR: None,
+                        MEAN_ABSOLUTE_ERROR: None, R2: None}
+    default_validation_metric = MEAN_SQUARED_ERROR
+    vector_size = 0
+
     def __init__(self, feature):
         super().__init__(feature)
-        self.type = VECTOR
-        self.vector_size = 0
+        self.overwrite_defaults(feature)
+        self.decoder_obj = self.initialize_decoder(feature)
+        self._setup_loss()
+        self._setup_metrics()
 
-        self.loss = {'type': MEAN_SQUARED_ERROR}
-        self.softmax = False
-
-        _ = self.overwrite_defaults(feature)
-
-    def _get_output_placeholder(self):
-        return tf.compat.v1.placeholder(
-            tf.float32,
-            [None, self.vector_size],
-            name='{}_placeholder'.format(self.name)
-        )
-
-    def _get_measures(self, targets, predictions):
-
-        with tf.compat.v1.variable_scope('measures_{}'.format(self.name)):
-            error_val = get_error(
-                targets,
-                predictions,
-                self.name
-            )
-
-            absolute_error_val = tf.reduce_sum(
-                get_absolute_error(targets, predictions, self.name), axis=1
-            )
-
-            squared_error_val = tf.reduce_sum(
-                get_squared_error(targets, predictions, self.name), axis=1
-            )
-
-            # TODO - not sure if this is correct
-            r2_val = tf.reduce_sum(get_r2(targets, predictions, self.name))
-
-        return error_val, squared_error_val, absolute_error_val, r2_val
-
-    def vector_loss(self, targets, predictions, logits):
-        with tf.compat.v1.variable_scope('loss_{}'.format(self.name)):
-            if self.loss['type'] == MEAN_SQUARED_ERROR:
-                train_loss = tf.reduce_sum(
-                    get_squared_error(targets, predictions, self.name), axis=1
-                )
-
-            elif self.loss['type'] == MEAN_ABSOLUTE_ERROR:
-                train_loss = tf.reduce_sum(
-                    get_absolute_error(targets, predictions, self.name), axis=1
-                )
-
-            elif self.loss['type'] == SOFTMAX_CROSS_ENTROPY:
-                train_loss = weighted_softmax_cross_entropy(
-                    logits,
-                    targets,
-                    self.loss
-                )
-
-            else:
-                train_mean_loss = None
-                train_loss = None
-                raise ValueError(
-                    'Unsupported loss type {}'.format(self.loss['type'])
-                )
-
-            train_mean_loss = tf.reduce_mean(
-                train_loss,
-                name='train_mean_loss_{}'.format(self.name)
-            )
-
-        return train_mean_loss, train_loss
-
-    def build_output(
+    def logits(
             self,
-            hidden,
-            hidden_size,
-            regularizer=None,
-            dropout_rate=None,
-            is_training=None,
+            inputs,  # hidden
             **kwargs
     ):
-        train_mean_loss, eval_loss, output_tensors = self.build_vector_output(
-            self._get_output_placeholder(),
-            hidden,
-            hidden_size,
-            regularizer=regularizer,
-        )
-        return train_mean_loss, eval_loss, output_tensors
+        hidden = inputs[HIDDEN]
+        return self.decoder_obj(hidden)
 
-    def build_vector_output(
+    def predictions(
             self,
-            targets,
-            hidden,
-            hidden_size,
-            regularizer=None,
+            inputs,  # logits
+            **kwargs
     ):
-        feature_name = self.name
-        output_tensors = {}
+        return {PREDICTIONS: inputs[LOGITS], LOGITS: inputs[LOGITS]}
 
-        # ================ Placeholder ================
-        output_tensors['{}'.format(feature_name)] = targets
+    def _setup_loss(self):
+        if self.loss[TYPE] == 'mean_squared_error':
+            self.train_loss_function = MSELoss()
+            self.eval_loss_function = MSEMetric(name='eval_loss')
+        elif self.loss[TYPE] == 'mean_absolute_error':
+            self.train_loss_function = MAELoss()
+            self.eval_loss_function = MAEMetric(name='eval_loss')
+        elif self.loss[TYPE] == SOFTMAX_CROSS_ENTROPY:
+            self.train_loss_function = SoftmaxCrossEntropyLoss(
+                num_classes=self.vector_size,
+                feature_loss=self.loss,
+                name='train_loss'
+            )
+            self.eval_loss_function = SoftmaxCrossEntropyMetric(
+                num_classes=self.vector_size,
+                feature_loss=self.loss,
+                name='eval_loss'
+            )
+        else:
+            raise ValueError(
+                'Unsupported loss type {}'.format(self.loss[TYPE])
+            )
 
-        # ================ Predictions ================
-        logits, logits_size, predictions = self.vector_predictions(
-            hidden,
-            hidden_size,
-            regularizer=regularizer,
+    def _setup_metrics(self):
+        self.metric_functions = {}  # needed to shadow class variable
+        self.metric_functions[LOSS] = self.eval_loss_function
+        self.metric_functions[ERROR] = ErrorScore(name='metric_error')
+        self.metric_functions[MEAN_SQUARED_ERROR] = MeanSquaredErrorMetric(
+            name='metric_mse'
         )
-
-        output_tensors[PREDICTIONS + '_' + feature_name] = predictions
-
-        # ================ Measures ============
-        error, squared_error, absolute_error, r2 = self._get_measures(
-            targets,
-            predictions
+        self.metric_functions[MEAN_ABSOLUTE_ERROR] = MeanAbsoluteErrorMetric(
+            name='metric_mae'
         )
+        self.metric_functions[R2] = R2Score(name='metric_r2')
 
-        output_tensors[ERROR + '_' + self.name] = error
-        output_tensors[SQUARED_ERROR + '_' + self.name] = squared_error
-        output_tensors[ABSOLUTE_ERROR + '_' + self.name] = absolute_error
-        output_tensors[R2 + '_' + self.name] = r2
+    def get_output_dtype(self):
+        return tf.float32
 
-        if 'sampled' not in self.loss['type']:
-            tf.compat.v1.summary.scalar(
-                'train_batch_mean_squared_error_{}'.format(self.name),
-                tf.reduce_mean(squared_error)
-            )
-            tf.compat.v1.summary.scalar(
-                'train_batch_mean_absolute_error_{}'.format(self.name),
-                tf.reduce_mean(absolute_error)
-            )
-            tf.compat.v1.summary.scalar(
-                'train_batch_mean_r2_{}'.format(self.name),
-                tf.reduce_mean(r2)
-            )
-
-        # ================ Loss ================
-        train_mean_loss, eval_loss = self.vector_loss(
-            targets, predictions, logits
-        )
-        output_tensors[EVAL_LOSS + '_' + self.name] = eval_loss
-        output_tensors[
-            TRAIN_MEAN_LOSS + '_' + self.name] = train_mean_loss
-
-        tf.compat.v1.summary.scalar(
-            'train_mean_loss_{}'.format(self.name),
-            train_mean_loss,
-        )
-
-        return train_mean_loss, eval_loss, output_tensors
-
-    def vector_predictions(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None,
-    ):
-        with tf.compat.v1.variable_scope('predictions_{}'.format(self.name)):
-            initializer_obj = get_initializer(self.initializer)
-            weights = tf.compat.v1.get_variable(
-                'weights',
-                initializer=initializer_obj([hidden_size, self.vector_size]),
-                regularizer=regularizer
-            )
-            logger.debug('  projection_weights: {0}'.format(weights))
-
-            biases = tf.compat.v1.get_variable(
-                'biases',
-                [self.vector_size]
-            )
-            logger.debug('  projection_biases: {0}'.format(biases))
-
-            logits = tf.matmul(hidden, weights) + biases
-            logger.debug('  logits: {0}'.format(logits))
-
-            if self.softmax:
-                predictions = tf.nn.softmax(logits)
-            else:
-                predictions = logits
-
-        return logits, self.vector_size, predictions
-
-    default_validation_measure = LOSS
-
-    output_config = OrderedDict([
-        (LOSS, {
-            'output': EVAL_LOSS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (MEAN_SQUARED_ERROR, {
-            'output': SQUARED_ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (MEAN_ABSOLUTE_ERROR, {
-            'output': ABSOLUTE_ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (R2, {
-            'output': R2,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (ERROR, {
-            'output': ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (PREDICTIONS, {
-            'output': PREDICTIONS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        })
-    ])
+    def get_output_shape(self):
+        return self.vector_size,
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             output_feature,
             feature_metadata,
             *args,
             **kwargs
     ):
-
         output_feature['vector_size'] = feature_metadata['vector_size']
 
     @staticmethod
     def calculate_overall_stats(
-            test_stats,
-            output_feature,
-            dataset,
+            predictions,
+            targets,
             train_set_metadata
     ):
-        pass
+        # no overall stats, just return empty dictionary
+        return {}
 
-    @staticmethod
-    def postprocess_results(
-            output_feature,
+    def postprocess_predictions(
+            self,
             result,
             metadata,
-            experiment_dir_name,
+            output_directory,
             skip_save_unprocessed_output=False,
     ):
         postprocessed = {}
-        npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')
-        name = output_feature['name']
+        name = self.feature_name
+
+        npy_filename = None
+        if is_on_master():
+            npy_filename = os.path.join(output_directory, '{}_{}.npy')
+        else:
+            skip_save_unprocessed_output = True
 
         if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            postprocessed[PREDICTIONS] = result[PREDICTIONS]
+            postprocessed[PREDICTIONS] = result[PREDICTIONS].numpy()
             if not skip_save_unprocessed_output:
                 np.save(
                     npy_filename.format(name, PREDICTIONS),
@@ -437,17 +268,18 @@ class VectorOutputFeature(VectorBaseFeature, OutputFeature):
 
     @staticmethod
     def populate_defaults(output_feature):
-
         set_default_value(output_feature, LOSS, {})
-        set_default_value(output_feature[LOSS], 'type', MEAN_SQUARED_ERROR)
+        set_default_value(output_feature[LOSS], TYPE, MEAN_SQUARED_ERROR)
         set_default_value(output_feature[LOSS], 'weight', 1)
         set_default_value(output_feature, 'reduce_input', None)
         set_default_value(output_feature, 'reduce_dependencies', None)
-        set_default_value(output_feature, 'softmax', False)
-        set_default_value(output_feature, 'decoder', 'fc_stack')
+        set_default_value(output_feature, 'decoder', 'projector')
         set_default_value(output_feature, 'dependencies', [])
 
-
-vector_encoder_registry = {
-    'fc_stack': Dense
-}
+    decoder_registry = {
+        'projector': Projector,
+        'null': Projector,
+        'none': Projector,
+        'None': Projector,
+        None: Projector
+    }

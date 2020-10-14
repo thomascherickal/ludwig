@@ -21,8 +21,9 @@ import sys
 import numpy as np
 import tensorflow as tf
 
-from ludwig.constants import AUDIO, BACKFILL
-from ludwig.features.base_feature import BaseFeature
+from ludwig.constants import AUDIO, BACKFILL, TIED, TYPE, NAME
+from ludwig.encoders.sequence_encoders import StackedCNN, ParallelCNN, \
+    StackedParallelCNN, StackedRNN, SequencePassthroughEncoder, StackedCNNRNN
 from ludwig.features.sequence_feature import SequenceInputFeature
 from ludwig.utils.audio_utils import calculate_incr_mean
 from ludwig.utils.audio_utils import calculate_incr_var
@@ -34,16 +35,14 @@ from ludwig.utils.audio_utils import get_non_symmetric_length
 from ludwig.utils.audio_utils import get_phase_stft_magnitude
 from ludwig.utils.audio_utils import get_stft_magnitude
 from ludwig.utils.data_utils import get_abs_path
-from ludwig.utils.misc import set_default_value
-from ludwig.utils.misc import set_default_values
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.misc_utils import set_default_values
 
 logger = logging.getLogger(__name__)
 
 
-class AudioBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = AUDIO
+class AudioFeatureMixin(object):
+    type = AUDIO
 
     preprocessing_defaults = {
         'audio_file_length_limit_in_s': 7.5,
@@ -52,7 +51,7 @@ class AudioBaseFeature(BaseFeature):
         'padding_value': 0,
         'norm': None,
         'audio_feature': {
-            'type': 'raw',
+            TYPE: 'raw',
         }
     }
 
@@ -72,11 +71,11 @@ class AudioBaseFeature(BaseFeature):
         first_audio_file_path = column[0]
         _, sampling_rate_in_hz = soundfile.read(first_audio_file_path)
 
-        feature_dim = AudioBaseFeature._get_feature_dim(audio_feature_dict,
-                                                        sampling_rate_in_hz)
+        feature_dim = AudioFeatureMixin._get_feature_dim(audio_feature_dict,
+                                                         sampling_rate_in_hz)
         audio_file_length_limit_in_s = preprocessing_parameters[
             'audio_file_length_limit_in_s']
-        max_length = AudioBaseFeature._get_max_length_feature(
+        max_length = AudioFeatureMixin._get_max_length_feature(
             audio_feature_dict, sampling_rate_in_hz,
             audio_file_length_limit_in_s)
         return {
@@ -87,7 +86,7 @@ class AudioBaseFeature(BaseFeature):
 
     @staticmethod
     def _get_feature_dim(audio_feature_dict, sampling_rate_in_hz):
-        feature_type = audio_feature_dict['type']
+        feature_type = audio_feature_dict[TYPE]
 
         if feature_type == 'raw':
             feature_dim = 1
@@ -127,17 +126,17 @@ class AudioBaseFeature(BaseFeature):
             )
             sys.exit(-1)
 
-        feature_type = audio_feature_dict['type']
+        feature_type = audio_feature_dict[TYPE]
         audio, sampling_rate_in_hz = soundfile.read(filepath)
-        AudioBaseFeature._update(audio_stats, audio, sampling_rate_in_hz)
+        AudioFeatureMixin._update(audio_stats, audio, sampling_rate_in_hz)
 
         if feature_type == 'raw':
             audio_feature = np.expand_dims(audio, axis=-1)
         elif feature_type in ['stft', 'stft_phase', 'group_delay', 'fbank']:
             audio_feature = np.transpose(
-                AudioBaseFeature._get_2D_feature(audio, feature_type,
-                                                 audio_feature_dict,
-                                                 sampling_rate_in_hz))
+                AudioFeatureMixin._get_2D_feature(audio, feature_type,
+                                                  audio_feature_dict,
+                                                  sampling_rate_in_hz))
         else:
             raise ValueError('{} is not recognized.'.format(feature_type))
 
@@ -151,7 +150,8 @@ class AudioBaseFeature(BaseFeature):
 
         feature_length = audio_feature.shape[0]
         broadcast_feature_length = min(feature_length, max_length)
-        audio_feature_padded = np.full((max_length, feature_dim), padding_value,
+        audio_feature_padded = np.full((max_length, feature_dim),
+                                       padding_value,
                                        dtype=np.float32)
         audio_feature_padded[:broadcast_feature_length, :] = audio_feature[
                                                              :max_length, :]
@@ -222,7 +222,7 @@ class AudioBaseFeature(BaseFeature):
     def add_feature_data(
             feature,
             dataset_df,
-            data,
+            dataset,
             metadata,
             preprocessing_parameters
     ):
@@ -236,24 +236,25 @@ class AudioBaseFeature(BaseFeature):
             raise ValueError(
                 'audio_feature dictionary has to be present in preprocessing '
                 'for audio.')
-        if not 'type' in preprocessing_parameters['audio_feature']:
+        if not TYPE in preprocessing_parameters['audio_feature']:
             raise ValueError(
                 'type has to be present in audio_feature dictionary '
                 'for audio.')
 
-        csv_path = None
-        if hasattr(dataset_df, 'csv'):
-            csv_path = os.path.dirname(os.path.abspath(dataset_df.csv))
-        if (csv_path is None and
-                not os.path.isabs(dataset_df[feature['name']][0])):
-            raise ValueError(
-                'Audio file paths must be absolute'
-            )
+        src_path = None
+        # this is not super nice, but works both and DFs and lists
+        first_path = '.'
+        for first_path in dataset_df[feature[NAME]]:
+            break
+        if hasattr(dataset_df, 'src'):
+            src_path = os.path.dirname(os.path.abspath(dataset_df.src))
+        if src_path is None and not os.path.isabs(first_path):
+            raise ValueError('Audio file paths must be absolute')
 
         num_audio_utterances = len(dataset_df)
         padding_value = preprocessing_parameters['padding_value']
         normalization_type = preprocessing_parameters['norm']
-        feature_name = feature['name']
+        feature_name = feature[NAME]
 
         feature_dim = metadata[feature_name]['feature_dim']
         max_length = metadata[feature_name]['max_length']
@@ -276,38 +277,39 @@ class AudioBaseFeature(BaseFeature):
         }
 
         if feature['preprocessing']['in_memory']:
-            data[feature['name']] = np.empty(
+            dataset[feature[NAME]] = np.empty(
                 (num_audio_utterances, max_length, feature_dim),
                 dtype=np.float32
             )
-            for i in range(len(dataset_df)):
+            for i, path in enumerate(dataset_df[feature[NAME]]):
                 filepath = get_abs_path(
-                    csv_path,
-                    dataset_df[feature['name']][i]
+                    src_path,
+                    path
                 )
-                audio_feature = AudioBaseFeature._read_audio_and_transform_to_feature(
+                audio_feature = AudioFeatureMixin._read_audio_and_transform_to_feature(
                     filepath, audio_feature_dict, feature_dim, max_length,
                     padding_value, normalization_type, audio_stats
                 )
 
-                data[feature['name']][i, :, :] = audio_feature
+                dataset[feature[NAME]][i, :, :] = audio_feature
 
             audio_stats['std'] = np.sqrt(
                 audio_stats['var'] / float(audio_stats['count']))
-            print_statistics = """
-            {} audio files loaded.
-            Statistics of audio file lengths:
-            - mean: {:.4f}
-            - std: {:.4f}
-            - max: {:.4f}
-            - min: {:.4f}
-            - cropped audio_files: {}
-            Max length was given as {}.
-            """.format(audio_stats['count'], audio_stats['mean'],
-                       audio_stats['std'], audio_stats['max'],
-                       audio_stats['min'], audio_stats['cropped'],
-                       audio_stats['max_length_in_s'])
-            print(print_statistics)
+            print_statistics = (
+                "{} audio files loaded.\n"
+                "Statistics of audio file lengths:\n"
+                "- mean: {:.4f}\n"
+                "- std: {:.4f}\n"
+                "- max: {:.4f}\n"
+                "- min: {:.4f}\n"
+                "- cropped audio_files: {}\n"
+                "Max length was given as {}s"
+            ).format(
+                audio_stats['count'], audio_stats['mean'],
+                audio_stats['std'], audio_stats['max'],
+                audio_stats['min'], audio_stats['cropped'],
+                audio_stats['max_length_in_s'])
+            logger.debug(print_statistics)
 
     @staticmethod
     def _get_max_length_feature(
@@ -315,7 +317,7 @@ class AudioBaseFeature(BaseFeature):
             sampling_rate_in_hz,
             audio_length_limit_in_s
     ):
-        feature_type = audio_feature_dict['type']
+        feature_type = audio_feature_dict[TYPE]
         audio_length_limit_in_samp = (
                 audio_length_limit_in_s * sampling_rate_in_hz
         )
@@ -341,54 +343,47 @@ class AudioBaseFeature(BaseFeature):
             raise ValueError('{} is not recognized.'.format(feature_type))
 
 
-class AudioInputFeature(AudioBaseFeature, SequenceInputFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = AUDIO
-        self.length = None
-        self.embedding_size = None
-        self.overwrite_defaults(feature)
+class AudioInputFeature(AudioFeatureMixin, SequenceInputFeature):
+    encoder = 'parallel_cnn'
+    max_sequence_length = None
+    embedding_size = None
+
+    def __init__(self, feature, encoder_obj=None):
+        super().__init__(feature, encoder_obj=encoder_obj)
         if not self.embedding_size:
             raise ValueError(
                 'embedding_size has to be defined - '
-                'check "update_model_definition_with_metadata()"')
-        if not self.length:
+                'check "update_config_with_metadata()"')
+        if not self.max_sequence_length:
             raise ValueError(
-                'length has to be defined - '
-                'check "update_model_definition_with_metadata()"')
+                'max_sequence_length has to be defined - '
+                'check "update_config_with_metadata()"')
 
-    def _get_input_placeholder(self):
-        return tf.compat.v1.placeholder(
-            tf.float32, shape=[None, self.length, self.embedding_size],
-            name='{}_placeholder'.format(self.name)
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype == tf.float32
+        assert len(inputs.shape) == 3
+
+        encoder_output = self.encoder_obj(
+            inputs, training=training, mask=mask
         )
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logger.debug('  placeholder: {0}'.format(placeholder))
+        return encoder_output
 
-        return self.build_sequence_input(
-            placeholder,
-            self.encoder_obj,
-            regularizer,
-            dropout_rate,
-            is_training
-        )
+    def get_input_dtype(self):
+        return tf.float32
+
+    def get_input_shape(self):
+        return self.max_sequence_length, self.embedding_size
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
             **kwargs
     ):
-        input_feature['length'] = feature_metadata['max_length']
+        input_feature['max_sequence_length'] = feature_metadata['max_length']
         input_feature['embedding_size'] = feature_metadata['feature_dim']
         input_feature['should_embed'] = False
 
@@ -397,7 +392,20 @@ class AudioInputFeature(AudioBaseFeature, SequenceInputFeature):
         set_default_values(
             input_feature,
             {
-                'tied_weights': None,
+                TIED: None,
                 'preprocessing': {}
             }
         )
+
+    encoder_registry = {
+        'stacked_cnn': StackedCNN,
+        'parallel_cnn': ParallelCNN,
+        'stacked_parallel_cnn': StackedParallelCNN,
+        'rnn': StackedRNN,
+        'cnnrnn': StackedCNNRNN,
+        'passthrough': SequencePassthroughEncoder,
+        'null': SequencePassthroughEncoder,
+        'none': SequencePassthroughEncoder,
+        'None': SequencePassthroughEncoder,
+        None: SequencePassthroughEncoder
+    }

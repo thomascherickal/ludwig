@@ -21,32 +21,29 @@ import numpy as np
 import tensorflow as tf
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.encoders.bag_encoders import BagEmbedWeightedEncoder
 from ludwig.features.base_feature import InputFeature
 from ludwig.features.feature_utils import set_str_to_idx
-from ludwig.models.modules.embedding_modules import EmbedWeighted
-from ludwig.utils.misc import set_default_value
-from ludwig.utils.strings_utils import create_vocabulary
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.strings_utils import create_vocabulary, UNKNOWN_SYMBOL
 
 logger = logging.getLogger(__name__)
 
 
-class BagBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = BAG
+class BagFeatureMixin(object):
+    type = BAG
 
     preprocessing_defaults = {
         'tokenizer': 'space',
         'most_common': 10000,
         'lowercase': False,
         'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': ''
+        'fill_value': UNKNOWN_SYMBOL
     }
 
     @staticmethod
     def get_feature_meta(column, preprocessing_parameters):
-        idx2str, str2idx, str2freq, max_size = create_vocabulary(
+        idx2str, str2idx, str2freq, max_size, _, _, _ = create_vocabulary(
             column,
             preprocessing_parameters['tokenizer'],
             num_most_frequent=preprocessing_parameters['most_common'],
@@ -65,16 +62,17 @@ class BagBaseFeature(BaseFeature):
         bag_matrix = np.zeros(
             (len(column),
              len(metadata['str2idx'])),
-            dtype=float
+            dtype=np.float32
         )
 
-        for i in range(len(column)):
+        for i, set_str in enumerate(column):
             col_counter = Counter(set_str_to_idx(
-                column[i],
+                set_str,
                 metadata['str2idx'],
                 preprocessing_parameters['tokenizer'])
             )
-            bag_matrix[i, list(col_counter.keys())] = list(col_counter.values())
+            bag_matrix[i, list(col_counter.keys())] = list(
+                col_counter.values())
 
         return bag_matrix
 
@@ -82,83 +80,44 @@ class BagBaseFeature(BaseFeature):
     def add_feature_data(
             feature,
             dataset_df,
-            data,
+            dataset,
             metadata,
             preprocessing_parameters=None
     ):
-        data[feature['name']] = BagBaseFeature.feature_data(
-            dataset_df[feature['name']].astype(str),
-            metadata[feature['name']],
+        dataset[feature[NAME]] = BagFeatureMixin.feature_data(
+            dataset_df[feature[NAME]].astype(str),
+            metadata[feature[NAME]],
             preprocessing_parameters
         )
 
 
-class BagInputFeature(BagBaseFeature, InputFeature):
-    def __init__(self, feature):
+class BagInputFeature(BagFeatureMixin, InputFeature):
+    encoder = 'embed'
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        self.vocab = []
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        # assert inputs.dtype == tf.bool # this fails
 
-        self.embedding_size = 50
-        self.representation = 'dense'
-        self.embeddings_trainable = True
-        self.pretrained_embeddings = None
-        self.embeddings_on_cpu = False
-        self.dropout = False
-        self.initializer = None
-        self.regularize = True
+        encoder_output = self.encoder_obj(inputs, training=training, mask=mask)
 
-        _ = self.overwrite_defaults(feature)
+        return {'encoder_output': encoder_output}
 
-        self.embed_weighted = EmbedWeighted(
-            self.vocab,
-            self.embedding_size,
-            representation=self.representation,
-            embeddings_trainable=self.embeddings_trainable,
-            pretrained_embeddings=self.pretrained_embeddings,
-            embeddings_on_cpu=self.embeddings_on_cpu,
-            dropout=self.dropout,
-            initializer=self.initializer,
-            regularize=self.regularize
-        )
+    def get_input_dtype(self):
+        return tf.float32
 
-    def _get_input_placeholder(self):
-        # None dimension is for dealing with variable batch size
-        return tf.compat.v1.placeholder(
-            tf.float32,
-            shape=[None, len(self.vocab)],
-            name=self.name
-        )
-
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logger.debug('placeholder: {0}'.format(placeholder))
-
-        embedded, embedding_size = self.embed_weighted(
-            placeholder,
-            regularizer,
-            dropout_rate,
-            is_training=False
-        )
-        logger.debug('feature_representation: {0}'.format(embedded))
-
-        feature_representation = {
-            'name': self.name,
-            'type': self.type,
-            'representation': embedded,
-            'size': embedding_size,
-            'placeholder': placeholder
-        }
-        return feature_representation
+    def get_input_shape(self):
+        return len(self.vocab),
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
@@ -168,4 +127,9 @@ class BagInputFeature(BagBaseFeature, InputFeature):
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
+
+    encoder_registry = {
+        'embed': BagEmbedWeightedEncoder,
+        None: BagEmbedWeightedEncoder
+    }

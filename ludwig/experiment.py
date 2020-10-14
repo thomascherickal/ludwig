@@ -14,277 +14,299 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 import logging
 import os
 import sys
+from typing import List, Union
+
+import pandas as pd
 import yaml
 
-from ludwig.contrib import contrib_command
-from ludwig.data.postprocessing import postprocess
-from ludwig.globals import LUDWIG_VERSION, set_on_master, is_on_master
-from ludwig.predict import predict
-from ludwig.predict import print_test_results
-from ludwig.predict import save_prediction_outputs
-from ludwig.predict import save_test_statistics
-from ludwig.train import full_train
+from ludwig.api import LudwigModel, kfold_cross_validate
+from ludwig.constants import FULL, TEST, TRAINING, VALIDATION
+from ludwig.contrib import contrib_command, contrib_import
+from ludwig.globals import LUDWIG_VERSION
+from ludwig.utils.data_utils import save_json
 from ludwig.utils.defaults import default_random_seed
-from ludwig.utils.print_utils import logging_level_registry
-from ludwig.utils.print_utils import print_ludwig
-
+from ludwig.utils.horovod_utils import is_on_master, set_on_master
+from ludwig.utils.misc_utils import check_which_config
+from ludwig.utils.print_utils import logging_level_registry, print_ludwig
 
 logger = logging.getLogger(__name__)
 
 
-def experiment(
-        model_definition,
-        model_definition_file=None,
-        data_csv=None,
-        data_train_csv=None,
-        data_validation_csv=None,
-        data_test_csv=None,
-        data_hdf5=None,
-        data_train_hdf5=None,
-        data_validation_hdf5=None,
-        data_test_hdf5=None,
-        train_set_metadata_json=None,
-        experiment_name='experiment',
-        model_name='run',
-        model_load_path=None,
-        model_resume_path=None,
-        skip_save_training_description=False,
-        skip_save_training_statistics=False,
-        skip_save_model=False,
-        skip_save_progress=False,
-        skip_save_log=False,
-        skip_save_processed_input=False,
-        skip_save_unprocessed_output=False,
-        skip_save_test_predictions=False,
-        skip_save_test_statistics=False,
-        output_directory='results',
-        gpus=None,
-        gpu_fraction=1.0,
-        use_horovod=False,
-        random_seed=default_random_seed,
-        debug=False,
+def experiment_cli(
+        config: dict,
+        config_file: str = None,
+        dataset: Union[str, dict, pd.DataFrame] = None,
+        training_set: Union[str, dict, pd.DataFrame] = None,
+        validation_set: Union[str, dict, pd.DataFrame] = None,
+        test_set: Union[str, dict, pd.DataFrame] = None,
+        training_set_metadata: Union[str, dict] = None,
+        data_format: str = None,
+        experiment_name: str = 'experiment',
+        model_name: str = 'run',
+        model_load_path: str = None,
+        model_resume_path: str = None,
+        eval_split: str = TEST,
+        skip_save_training_description: bool = False,
+        skip_save_training_statistics: bool = False,
+        skip_save_model: bool = False,
+        skip_save_progress: bool = False,
+        skip_save_log: bool = False,
+        skip_save_processed_input: bool = False,
+        skip_save_unprocessed_output: bool = False,
+        skip_save_predictions: bool = False,
+        skip_save_eval_stats: bool = False,
+        skip_collect_predictions: bool = False,
+        skip_collect_overall_stats: bool = False,
+        output_directory: str = 'results',
+        gpus: Union[str, int, List[int]] = None,
+        gpu_memory_limit: int = None,
+        allow_parallel_threads: bool = True,
+        use_horovod: bool = None,
+        random_seed: int = default_random_seed,
+        debug: bool = False,
+        logging_level: int = logging.INFO,
         **kwargs
 ):
     """Trains a model on a dataset's training and validation splits and
     uses it to predict on the test split.
     It saves the trained model and the statistics of training and testing.
-    :param model_definition: Model definition which defines the different
-           parameters of the model, features, preprocessing and training.
-    :type model_definition: Dictionary
-    :param model_definition_file: The file that specifies the model definition.
-           It is a yaml file.
-    :type model_definition_file: filepath (str)
-    :param data_csv: A CSV file containing the input data which is used to
-           train, validate and test a model. The CSV either contains a
-           split column or will be split.
-    :type data_csv: filepath (str)
-    :param data_train_csv: A CSV file containing the input data which is used
-           to train a model.
-    :type data_train_csv: filepath (str)
-    :param data_validation_csv: A CSV file containing the input data which is used
-           to validate a model..
-    :type data_validation_csv: filepath (str)
-    :param data_test_csv: A CSV file containing the input data which is used
-           to test a model.
-    :type data_test_csv: filepath (str)
-    :param data_hdf5: If the dataset is in the hdf5 format, this is used instead
-           of the csv file.
-    :type data_hdf5: filepath (str)
-    :param data_train_hdf5: If the training set is in the hdf5 format, this is
-           used instead of the csv file.
-    :type data_train_hdf5: filepath (str)
-    :param data_validation_hdf5: If the validation set is in the hdf5 format,
-           this is used instead of the csv file.
-    :type data_validation_hdf5: filepath (str)
-    :param data_test_hdf5: If the test set is in the hdf5 format, this is
-           used instead of the csv file.
-    :type data_test_hdf5: filepath (str)
-    :param train_set_metadata_json: If the dataset is in hdf5 format, this is
-           the associated json file containing metadata.
-    :type train_set_metadata_json: filepath (str)
-    :param experiment_name: The name for the experiment.
-    :type experiment_name: Str
-    :param model_name: Name of the model that is being used.
-    :type model_name: Str
-    :param model_load_path: If this is specified the loaded model will be used
-           as initialization (useful for transfer learning).
-    :type model_load_path: filepath (str)
-    :param model_resume_path: Resumes training of the model from the path
-           specified. The difference with model_load_path is that also training
-           statistics like the current epoch and the loss and performance so
-           far are also resumed effectively continuing a previously interrupted
-           training process.
-    :type model_resume_path: filepath (str)
-    :param skip_save_training_description: Disables saving
-           the description JSON file.
-    :type skip_save_training_description: Boolean
-    :param skip_save_training_statistics: Disables saving
-           training statistics JSON file.
-    :type skip_save_training_statistics: Boolean
-    :param skip_save_model: Disables
-               saving model weights and hyperparameters each time the model
-           improves. By default Ludwig saves model weights after each epoch
-           the validation measure improves, but if the model is really big
-           that can be time consuming if you do not want to keep
-           the weights and just find out what performance can a model get
-           with a set of hyperparameters, use this parameter to skip it,
-           but the model will not be loadable later on.
-    :type skip_save_model: Boolean
-    :param skip_save_progress: Disables saving
-           progress each epoch. By default Ludwig saves weights and stats
-           after each epoch for enabling resuming of training, but if
-           the model is really big that can be time consuming and will uses
-           twice as much space, use this parameter to skip it, but training
-           cannot be resumed later on.
-    :type skip_save_progress: Boolean
-    :param skip_save_log: Disables saving TensorBoard
-           logs. By default Ludwig saves logs for the TensorBoard, but if it
-           is not needed turning it off can slightly increase the
-           overall speed..
-    :type skip_save_log: Boolean
-    :param skip_save_processed_input: If a CSV dataset is provided it is
-           preprocessed and then saved as an hdf5 and json to avoid running
-           the preprocessing again. If this parameter is False,
-           the hdf5 and json file are not saved.
-    :type skip_save_processed_input: Boolean
-    :param skip_save_unprocessed_output: By default predictions and
-           their probabilities are saved in both raw unprocessed numpy files
-           containing tensors and as postprocessed CSV files
-           (one for each output feature). If this parameter is True,
-           only the CSV ones are saved and the numpy ones are skipped.
-    :type skip_save_unprocessed_output: Boolean
-    :param skip_save_test_predictions: skips saving test predictions CSV files
-    :type skip_save_test_predictions: Boolean
-    :param skip_save_test_statistics: skips saving test statistics JSON file
-    :type skip_save_test_statistics: Boolean
-    :param output_directory: The directory that will contain the training
-           statistics, the saved model and the training progress files.
-    :type output_directory: filepath (str)
-    :param gpus: List of GPUs that are available for training.
-    :type gpus: List
-    :param gpu_fraction: Fraction of the memory of each GPU to use at
-           the beginning of the training. The memory may grow elastically.
-    :type gpu_fraction: Integer
-    :param use_horovod: Flag for using horovod
-    :type use_horovod: Boolean
-    :param random_seed: Random seed used for weights initialization,
-           splits and any other random function.
-    :type random_seed: Integer
-    :param debug: If true turns on tfdbg with inf_or_nan checks.
-    :type debug: Boolean
+
+    # Inputs
+
+    :param config: (dict) config which defines the different
+        parameters of the model, features, preprocessing and training.
+    :param config_file: (str, default: `None`) the filepath string
+        that specifies the config.  It is a yaml file.
+    :param dataset: (Union[str, dict, pandas.DataFrame], default: `None`)
+        source containing the entire dataset to be used in the experiment.
+        If it has a split column, it will be used for splitting (0 for train,
+        1 for validation, 2 for test), otherwise the dataset will be
+        randomly split.
+    :param training_set: (Union[str, dict, pandas.DataFrame], default: `None`)
+        source containing training data.
+    :param validation_set: (Union[str, dict, pandas.DataFrame], default: `None`)
+        source containing validation data.
+    :param test_set: (Union[str, dict, pandas.DataFrame], default: `None`)
+        source containing test data.
+    :param training_set_metadata: (Union[str, dict], default: `None`)
+        metadata JSON file or loaded metadata.  Intermediate preprocessed
+        structure containing the mappings of the input
+        dataset created the first time an input file is used in the same
+        directory with the same name and a '.meta.json' extension.
+    :param data_format: (str, default: `None`) format to interpret data
+        sources. Will be inferred automatically if not specified.  Valid
+        formats are `'auto'`, `'csv'`, `'excel'`, `'feather'`,
+        `'fwf'`, `'hdf5'` (cache file produced during previous training),
+        `'html'` (file containing a single HTML `<table>`), `'json'`, `'jsonl'`,
+        `'parquet'`, `'pickle'` (pickled Pandas DataFrame), `'sas'`, `'spss'`,
+        `'stata'`, `'tsv'`.
+    :param experiment_name: (str, default: `'experiment'`) name for
+        the experiment.
+    :param model_name: (str, default: `'run'`) name of the model that is
+        being used.
+    :param model_load_path: (str, default: `None`) if this is specified the
+        loaded model will be used as initialization
+        (useful for transfer learning).
+    :param model_resume_path: (str, default: `None`) resumes training of
+        the model from the path specified. The config is restored.
+        In addition to config, training statistics and loss for
+        epoch and the state of the optimizer are restored such that
+        training can be effectively continued from a previously interrupted
+        training process.
+    :param eval_split: (str, default: `test`) split on which
+        to perform evaluation. Valid values are `training`, `validation`
+        and `test`.
+    :param skip_save_training_description: (bool, default: `False`) disables
+        saving the description JSON file.
+    :param skip_save_training_statistics: (bool, default: `False`) disables
+        saving training statistics JSON file.
+    :param skip_save_model: (bool, default: `False`) disables
+        saving model weights and hyperparameters each time the model
+        improves. By default Ludwig saves model weights after each epoch
+        the validation metric improves, but if the model is really big
+        that can be time consuming. If you do not want to keep
+        the weights and just find out what performance a model can get
+        with a set of hyperparameters, use this parameter to skip it,
+        but the model will not be loadable later on and the returned model
+        will have the weights obtained at the end of training, instead of
+        the weights of the epoch with the best validation performance.
+   :param skip_save_progress: (bool, default: `False`) disables saving
+        progress each epoch. By default Ludwig saves weights and stats
+        after each epoch for enabling resuming of training, but if
+        the model is really big that can be time consuming and will uses
+        twice as much space, use this parameter to skip it, but training
+        cannot be resumed later on.
+    :param skip_save_log: (bool, default: `False`) disables saving
+        TensorBoard logs. By default Ludwig saves logs for the TensorBoard,
+        but if it is not needed turning it off can slightly increase the
+        overall speed.
+    :param skip_save_processed_input: (bool, default: `False`) if input
+        dataset is provided it is preprocessed and cached by saving an HDF5
+        and JSON files to avoid running the preprocessing again. If this
+        parameter is `False`, the HDF5 and JSON file are not saved.
+    :param skip_save_unprocessed_output: (bool, default: `False`) by default
+        predictions and their probabilities are saved in both raw
+        unprocessed numpy files containing tensors and as postprocessed
+        CSV files (one for each output feature). If this parameter is True,
+        only the CSV ones are saved and the numpy ones are skipped.
+    :param skip_save_predictions: (bool, default: `False`) skips saving test
+        predictions CSV files
+    :param skip_save_eval_stats: (bool, default: `False`) skips saving test
+        statistics JSON file
+   :param skip_collect_predictions: (bool, default: `False`) skips
+        collecting post-processed predictions during eval.
+    :param skip_collect_overall_stats: (bool, default: `False`) skips
+        collecting overall stats during eval.
+    :param output_directory: (str, default: `'results'`) the directory that
+        will contain the training statistics, TensorBoard logs, the saved
+        model and the training progress files.
+    :param gpus: (list, default: `None`) list of GPUs that are available
+        for training.
+    :param gpu_memory_limit: (int, default: `None`) maximum memory in MB to
+        allocate per GPU device.
+    :param allow_parallel_threads: (bool, default: `True`) allow TensorFlow
+        to use multithreading parallelism to improve performance at
+        the cost of determinism.
+    :param use_horovod: (bool, default: `None`) flag for using horovod.
+    :param random_seed: (int: default: 42) random seed used for weights
+        initialization, splits and any other random function.
+    :param debug: (bool, default: `False) if `True` turns on `tfdbg` with
+        `inf_or_nan` checks.
+    :param logging_level: (int) Log level that will be sent to stderr.
+
+    # Return
+    :return: (Tuple[LudwigModel, dict, dict, tuple, str)) `(model, evaluation_statistics, training_statistics, preprocessed_data, output_directory)`
+        `model` LudwigModel instance
+        `evaluation_statistics` dictionary with evaluation performance
+            statistics on the test_set,
+        `training_statistics` is a dictionary of training statistics for
+            each output
+        feature containing loss and metrics values for each epoch,
+        `preprocessed_data` tuple containing preprocessed
+        `(training_set, validation_set, test_set)`, `output_directory`
+        filepath string to where results are stored.
+
     """
+    set_on_master(use_horovod)
+
+    config = check_which_config(config,
+                                config_file)
+
+    if model_load_path:
+        model = LudwigModel.load(model_load_path)
+    else:
+        model = LudwigModel(
+            config=config,
+            logging_level=logging_level,
+            use_horovod=use_horovod,
+            gpus=gpus,
+            gpu_memory_limit=gpu_memory_limit,
+            allow_parallel_threads=allow_parallel_threads,
+        )
     (
-        model,
+        eval_stats,
+        train_stats,
         preprocessed_data,
-        experiment_dir_name,
-        _,
-        model_definition
-    ) = full_train(
-        model_definition,
-        model_definition_file=model_definition_file,
-        data_csv=data_csv,
-        data_train_csv=data_train_csv,
-        data_validation_csv=data_validation_csv,
-        data_test_csv=data_test_csv,
-        data_hdf5=data_hdf5,
-        data_train_hdf5=data_train_hdf5,
-        data_validation_hdf5=data_validation_hdf5,
-        data_test_hdf5=data_test_hdf5,
-        train_set_metadata_json=train_set_metadata_json,
+        output_directory
+    ) = model.experiment(
+        dataset=dataset,
+        training_set=training_set,
+        validation_set=validation_set,
+        test_set=test_set,
+        training_set_metadata=training_set_metadata,
+        data_format=data_format,
         experiment_name=experiment_name,
         model_name=model_name,
-        model_load_path=model_load_path,
         model_resume_path=model_resume_path,
+        eval_split=eval_split,
         skip_save_training_description=skip_save_training_description,
         skip_save_training_statistics=skip_save_training_statistics,
         skip_save_model=skip_save_model,
         skip_save_progress=skip_save_progress,
         skip_save_log=skip_save_log,
         skip_save_processed_input=skip_save_processed_input,
+        skip_save_unprocessed_output=skip_save_unprocessed_output,
+        skip_save_predictions=skip_save_predictions,
+        skip_save_eval_stats=skip_save_eval_stats,
+        skip_collect_predictions=skip_collect_predictions,
+        skip_collect_overall_stats=skip_collect_overall_stats,
         output_directory=output_directory,
-        should_close_session=False,
-        gpus=gpus,
-        gpu_fraction=gpu_fraction,
-        use_horovod=use_horovod,
         random_seed=random_seed,
         debug=debug,
-        **kwargs
     )
 
-    (training_set,
-     validation_set,
-     test_set,
-     train_set_metadata) = preprocessed_data
+    return model, eval_stats, train_stats, preprocessed_data, output_directory
 
-    if test_set is not None:
-        if model_definition['training']['eval_batch_size'] > 0:
-            batch_size = model_definition['training']['eval_batch_size']
-        else:
-            batch_size = model_definition['training']['batch_size']
 
-        # predict
-        test_results = predict(
-            test_set,
-            train_set_metadata,
-            model,
-            model_definition,
-            batch_size,
-            evaluate_performance=True,
-            gpus=gpus,
-            gpu_fraction=gpu_fraction,
-            debug=debug
+def kfold_cross_validate_cli(
+        k_fold,
+        config=None,
+        config_file=None,
+        dataset=None,
+        data_format=None,
+        output_directory='results',
+        random_seed=default_random_seed,
+        skip_save_k_fold_split_indices=False,
+        **kwargs
+):
+    """Wrapper function to performs k-fold cross validation.
+
+    # Inputs
+    :param k_fold: (int) number of folds to create for the cross-validation
+    :param config: (dict, default: None) a dictionary containing
+            information needed to build a model. Refer to the [User Guide]
+           (http://ludwig.ai/user_guide/#model-config) for details.
+    :param config_file: (string, optional, default: `None`) path to
+           a YAML file containing the config. If available it will be
+           used instead of the config dict.
+    :param data_csv: (string, default: None)
+    :param output_directory: (string, default: 'results')
+    :param random_seed: (int) Random seed used k-fold splits.
+    :param skip_save_k_fold_split_indices: (boolean, default: False) Disables
+            saving k-fold split indices
+
+    :return: None
+    """
+
+    if config is None and config_file is None:
+        raise ValueError(
+            "No config is provided 'config' or "
+            "'config_file' must be provided."
+        )
+    elif config is not None and config_file is not None:
+        raise ValueError(
+            "Cannot specify both 'config' and 'config_file'"
+            ", proivde only one of the parameters."
         )
 
-        # check if we need to create the output dir
-        if is_on_master():
-            if not (
-                    skip_save_unprocessed_output and
-                    skip_save_test_predictions and
-                    skip_save_test_statistics
-            ):
-                if not os.path.exists(experiment_dir_name):
-                    os.makedirs(experiment_dir_name)
+    (kfold_cv_stats,
+     kfold_split_indices) = kfold_cross_validate(
+        k_fold,
+        config=config if config is not None else
+        config_file,
+        dataset=dataset,
+        data_format=data_format,
+        output_directory=output_directory,
+        random_seed=random_seed
+    )
 
-        # postprocess
-        postprocessed_output = postprocess(
-            test_results,
-            model_definition['output_features'],
-            train_set_metadata,
-            experiment_dir_name,
-            skip_save_unprocessed_output or not is_on_master()
-        )
+    # save k-fold cv statistics
+    save_json(os.path.join(output_directory, 'kfold_training_statistics.json'),
+              kfold_cv_stats)
 
-        if is_on_master():
-            print_test_results(test_results)
-            if not skip_save_test_predictions:
-                save_prediction_outputs(
-                    postprocessed_output,
-                    experiment_dir_name
-                )
-            if not skip_save_test_statistics:
-                save_test_statistics(test_results, experiment_dir_name)
-    model.close_session()
-
-    if is_on_master():
-        logger.info('\nFinished: {0}_{1}'.format(
-            experiment_name, model_name))
-        logger.info('Saved to: {}'.format(experiment_dir_name))
-
-    contrib_command("experiment_save", experiment_dir_name)
-    return experiment_dir_name
+    # save k-fold split indices
+    if not skip_save_k_fold_split_indices:
+        save_json(os.path.join(output_directory, 'kfold_split_indices.json'),
+                  kfold_split_indices)
 
 
 def cli(sys_argv):
     parser = argparse.ArgumentParser(
-        description='This script trains and tests a model',
+        description='This script trains and evaluates a model',
         prog='ludwig experiment',
         usage='%(prog)s [options]'
     )
@@ -315,52 +337,41 @@ def cli(sys_argv):
     # Data parameters
     # ---------------
     parser.add_argument(
-        '--data_csv',
-        help='input data CSV file. If it has a split column, it will be used '
-             'for splitting (0: train, 1: validation, 2: test), otherwise the '
-             'dataset will be randomly split'
+        '--dataset',
+        help='input data file path. '
+             'If it has a split column, it will be used for splitting '
+             '(0: train, 1: validation, 2: test), '
+             'otherwise the dataset will be randomly split'
     )
-    parser.add_argument('--data_train_csv', help='input train data CSV file')
+    parser.add_argument('--training_set', help='input train data file path')
     parser.add_argument(
-        '--data_validation_csv',
-        help='input validation data CSV file'
+        '--validation_set', help='input validation data file path'
     )
-    parser.add_argument('--data_test_csv', help='input test data CSV file')
+    parser.add_argument('--test_set', help='input test data file path')
 
     parser.add_argument(
-        '--data_hdf5',
-        help='input data HDF5 file. It is an intermediate preprocess version of'
-             ' the input CSV created the first time a CSV file is used in the '
-             'same directory with the same name and a hdf5 extension'
-    )
-    parser.add_argument(
-        '--data_train_hdf5',
-        help='input train data HDF5 file. It is an intermediate preprocess '
-             'version of the input CSV created the first time a CSV file is '
-             'used in the same directory with the same name and a hdf5 '
-             'extension'
-    )
-    parser.add_argument(
-        '--data_validation_hdf5',
-        help='input validation data HDF5 file. It is an intermediate preprocess'
-             ' version of the input CSV created the first time a CSV file is '
-             'used in the same directory with the same name and a hdf5 '
-             'extension'
-    )
-    parser.add_argument(
-        '--data_test_hdf5',
-        help='input test data HDF5 file. It is an intermediate preprocess '
-             'version of the input CSV created the first time a CSV file is '
-             'used in the same directory with the same name and a hdf5 '
-             'extension'
+        '--training_set_metadata',
+        help='input metadata JSON file path. An intermediate preprocessed file '
+             'containing the mappings of the input file created '
+             'the first time a file is used, in the same directory '
+             'with the same name and a .json extension'
     )
 
     parser.add_argument(
-        '--metadata_json',
-        help='input metadata JSON file. It is an intermediate preprocess file'
-             ' containing the mappings of the input CSV created the first time '
-             'a CSV file is used in the same directory with the same name and a'
-             ' json extension'
+        '--data_format',
+        help='format of the input data',
+        default='auto',
+        choices=['auto', 'csv', 'excel', 'feather', 'fwf', 'hdf5',
+                 'html' 'tables', 'json', 'jsonl', 'parquet', 'pickle', 'sas',
+                 'spss', 'stata', 'tsv']
+    )
+
+    parser.add_argument(
+        '-es',
+        '--eval_split',
+        default=TEST,
+        choices=[TRAINING, VALIDATION, TEST, FULL],
+        help='the split to evaluate the model on'
     )
 
     parser.add_argument(
@@ -378,19 +389,39 @@ def cli(sys_argv):
         default=False
     )
 
+    # -----------------
+    # K-fold parameters
+    # -----------------
+    parser.add_argument(
+        '-kf',
+        '--k_fold',
+        type=int,
+        default=None,
+        help='number of folds for a k-fold cross validation run '
+    )
+    parser.add_argument(
+        '-skfsi',
+        '--skip_save_k_fold_split_indices',
+        action='store_true',
+        default=False,
+        help='disables saving indices generated to split training data set '
+             'for the k-fold cross validation run, but if it is not needed '
+             'turning it off can slightly increase the overall speed'
+    )
+
     # ----------------
     # Model parameters
     # ----------------
-    model_definition = parser.add_mutually_exclusive_group(required=True)
-    model_definition.add_argument(
-        '-md',
-        '--model_definition',
+    config = parser.add_mutually_exclusive_group(required=True)
+    config.add_argument(
+        '-c',
+        '--config',
         type=yaml.safe_load,
-        help='model definition'
+        help='config'
     )
-    model_definition.add_argument(
-        '-mdf',
-        '--model_definition_file',
+    config.add_argument(
+        '-cf',
+        '--config_file',
         help='YAML file describing the model. Ignores --model_hyperparameters'
     )
 
@@ -402,7 +433,7 @@ def cli(sys_argv):
     parser.add_argument(
         '-mrp',
         '--model_resume_path',
-        help='path of a the model directory to resume training of'
+        help='path of the model directory to resume training of'
     )
     parser.add_argument(
         '-sstd',
@@ -420,14 +451,14 @@ def cli(sys_argv):
     )
     parser.add_argument(
         '-sstp',
-        '--skip_save_test_predictions',
+        '--skip_save_predictions',
         help='skips saving test predictions CSV files',
         action='store_true', default=False
     )
     parser.add_argument(
         '-sstes',
-        '--skip_save_test_statistics',
-        help='skips saving test statistics JSON file',
+        '--skip_save_eval_stats',
+        help='skips saving eval statistics JSON file',
         action='store_true', default=False
     )
     parser.add_argument(
@@ -438,9 +469,9 @@ def cli(sys_argv):
         help='disables saving model weights and hyperparameters each time '
              'the model improves. '
              'By default Ludwig saves model weights after each epoch '
-             'the validation measure imprvoes, but if the model is really big '
-             'that can be time consuming if you do not want to keep '
-             'the weights and just find out what performance can a model get '
+             'the validation metric imprvoes, but if the model is really big '
+             'that can be time consuming. If you do not want to keep '
+             'the weights and just find out what performance a model can get '
              'with a set of hyperparameters, use this parameter to skip it,'
              'but the model will not be loadable later on'
     )
@@ -450,7 +481,7 @@ def cli(sys_argv):
         action='store_true',
         default=False,
         help='disables saving progress each epoch. By default Ludwig saves '
-             'weights and stats  after each epoch for enabling resuming '
+             'weights and stats after each epoch for enabling resuming '
              'of training, but if the model is really big that can be '
              'time consuming and will uses twice as much space, use '
              'this parameter to skip it, but training cannot be resumed '
@@ -487,17 +518,24 @@ def cli(sys_argv):
         help='list of GPUs to use'
     )
     parser.add_argument(
-        '-gf',
-        '--gpu_fraction',
-        type=float,
-        default=1.0,
-        help='fraction of gpu memory to initialize the process with'
+        '-gml',
+        '--gpu_memory_limit',
+        type=int,
+        default=None,
+        help='maximum memory in MB to allocate per GPU device'
+    )
+    parser.add_argument(
+        '-dpt',
+        '--disable_parallel_threads',
+        action='store_false',
+        dest='allow_parallel_threads',
+        help='disable TensorFlow from using multithreading for reproducibility'
     )
     parser.add_argument(
         '-uh',
         '--use_horovod',
         action='store_true',
-        default=False,
+        default=None,
         help='uses horovod for distributed training'
     )
     parser.add_argument(
@@ -517,18 +555,25 @@ def cli(sys_argv):
 
     args = parser.parse_args(sys_argv)
 
+    args.logging_level = logging_level_registry[args.logging_level]
     logging.getLogger('ludwig').setLevel(
-        logging_level_registry[args.logging_level]
+        args.logging_level
     )
+    global logger
+    logger = logging.getLogger('ludwig.experiment')
 
     set_on_master(args.use_horovod)
 
     if is_on_master():
         print_ludwig('Experiment', LUDWIG_VERSION)
 
-    experiment(**vars(args))
+    if args.k_fold is None:
+        experiment_cli(**vars(args))
+    else:
+        kfold_cross_validate_cli(**vars(args))
 
 
 if __name__ == '__main__':
+    contrib_import()
     contrib_command("experiment", *sys.argv)
     cli(sys.argv[1:])

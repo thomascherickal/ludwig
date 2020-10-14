@@ -6,6 +6,14 @@ scipy>=0.18
 tabulate>=0.7
 scikit-learn
 tqdm
-tensorflow==1.14.0
+tensorflow>=2.2
+tfa-nightly==0.12.0.dev20200820045606
 PyYAML>=3.12
 absl-py
+
+# new data format support
+xlwt            # excel
+xlrd            # excel
+openpyxl        # excel
+pyarrow         # parquet
+lxml            # html

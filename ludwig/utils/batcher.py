@@ -18,45 +18,45 @@ import math
 
 import numpy as np
 
-from ludwig.utils.data_utils import shuffle_dict_unison_inplace, shuffle_inplace
+from ludwig.data.sampler import DistributedSampler
 
 
 class Batcher(object):
-    def __init__(self, dataset, batch_size=128, should_shuffle=True,
+    def __init__(self, dataset, sampler,
+                 batch_size=128,
                  ignore_last=False):
-        self.should_shuffle = should_shuffle
-
         # store our dataset as well
         self.dataset = dataset
-        if should_shuffle:
-            shuffle_inplace(self.dataset.get_dataset())
+        self.sampler = sampler
+        self.sample_it = iter(self.sampler)
 
         self.ignore_last = ignore_last
         self.batch_size = batch_size
-        self.total_size = dataset.size
-        self.steps_per_epoch = int(math.ceil(self.total_size / self.batch_size))
+        self.total_size = len(sampler)
+        self.steps_per_epoch = int(
+            math.ceil(self.total_size / self.batch_size))
         self.index = 0
         self.step = 0
-        self.epoch = 0
 
     def next_batch(self):
         if self.last_batch():
-            if self.should_shuffle:
-                self.dataset = shuffle_dict_unison_inplace(self.dataset)
-            self.reset()
-            self.epoch += 1
+            raise StopIteration()
+
+        indices = []
+        for _ in range(self.batch_size):
+            try:
+                indices.append(next(self.sample_it))
+                self.index += 1
+            except StopIteration:
+                break
 
         sub_batch = {}
         for features_name in self.dataset.features:
             sub_batch[features_name] = self.dataset.get(
                 features_name,
-                range(
-                    self.index,
-                    min(self.index + self.batch_size, self.total_size)
-                )
+                indices
             )
 
-        self.index += self.batch_size
         self.step += 1
         return sub_batch
 
@@ -65,9 +65,11 @@ class Batcher(object):
                 self.ignore_last and
                 self.index + self.batch_size >= self.total_size)
 
-    def reset(self):
+    def set_epoch(self, epoch):
         self.index = 0
         self.step = 0
+        self.sampler.set_epoch(epoch)
+        self.sample_it = iter(self.sampler)
 
 
 class BucketedBatcher(object):
@@ -160,60 +162,69 @@ class BucketedBatcher(object):
         self.step = 0
 
 
-class DistributedBatcher(object):
-    def __init__(self, dataset, partition_number, horovod, batch_size=128,
-                 should_shuffle=True, ignore_last=False):
-        self.should_shuffle = should_shuffle
+# todo future: reintroduce the bucketed batcher
+# def initialize_batcher(dataset, batch_size=128, bucketing_field=None,
+#                        input_features=None, preprocessing=None,
+#                        should_shuffle=True, ignore_last=False, horovod=None):
+#     if horovod:
+#         batcher = DistributedBatcher(
+#             dataset,
+#             horovod.rank(),
+#             horovod,
+#             batch_size,
+#             should_shuffle=should_shuffle,
+#             ignore_last=ignore_last
+#         )
+#     elif bucketing_field is not None:
+#         bucketing_feature = [
+#             feature for feature in input_features if
+#             feature[NAME] == bucketing_field
+#         ]
+#         if not bucketing_feature:
+#             raise ValueError(
+#                 'Bucketing field {} not present in input features'.format(
+#                     bucketing_field
+#                 )
+#             )
+#         else:
+#             bucketing_feature = bucketing_feature[0]
+#         should_trim = bucketing_feature[
+#                           'encoder'] in dynamic_length_encoders
+#         if 'preprocessing' in bucketing_feature:
+#             trim_side = bucketing_feature['preprocessing']['padding']
+#         else:
+#             trim_side = preprocessing[bucketing_feature[TYPE]]['padding']
+#
+#         batcher = BucketedBatcher(
+#             dataset,
+#             bucketing_field=bucketing_field,
+#             batch_size=batch_size,
+#             buckets=10,
+#             ignore_last=ignore_last,
+#             should_shuffle=should_shuffle,
+#             should_trim=should_trim,
+#             trim_side=trim_side
+#         )
+#     else:
+#         batcher = Batcher(
+#             dataset,
+#             batch_size,
+#             should_shuffle=should_shuffle,
+#             ignore_last=ignore_last
+#         )
+#     return batcher
 
-        # store our dataset as well
-        partition_size = dataset.size // horovod.size()
-        if partition_number == horovod.size() - 1:
-            self.partition = (partition_size * partition_number, dataset.size)
-        else:
-            self.partition = (partition_size * partition_number,
-                              partition_size * (partition_number + 1))
-        self.dataset = dataset
-        if should_shuffle:
-            shuffle_inplace(self.dataset.get_dataset())
-
-        self.ignore_last = ignore_last
-        self.batch_size = batch_size
-        self.total_size = self.partition[1] - self.partition[0]
-        self.steps_per_epoch = int(math.ceil(self.total_size / self.batch_size))
-        self.index = self.partition[0]
-        self.max_index = self.partition[1]
-        self.step = 0
-        self.epoch = 0
-
-    def next_batch(self):
-        if self.last_batch():
-            if self.should_shuffle:
-                self.dataset = shuffle_dict_unison_inplace(
-                    self.dataset,
-                    np.random.RandomState(self.epoch)
-                )
-            self.reset()
-            self.epoch += 1
-
-        sub_batch = {}
-        for features_name in self.dataset.features:
-            sub_batch[features_name] = self.dataset.get(
-                features_name,
-                range(
-                    self.index,
-                    min(self.index + self.batch_size, self.max_index)
-                )
-            )
-
-        self.index += self.batch_size
-        self.step += 1
-        return sub_batch
-
-    def last_batch(self):
-        return self.index >= self.max_index or (
-                self.ignore_last and
-                self.index + self.batch_size >= self.max_index)
-
-    def reset(self):
-        self.index = self.partition[0]
-        self.step = 0
+def initialize_batcher(dataset, batch_size=128,
+                       should_shuffle=True,
+                       seed=0,
+                       ignore_last=False,
+                       horovod=None):
+    sampler = DistributedSampler(len(dataset),
+                                 shuffle=should_shuffle,
+                                 seed=seed,
+                                 horovod=horovod)
+    batcher = Batcher(dataset,
+                      sampler,
+                      batch_size=batch_size,
+                      ignore_last=ignore_last)
+    return batcher

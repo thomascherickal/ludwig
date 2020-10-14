@@ -14,237 +14,105 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 import logging
-import os
 import sys
-from collections import OrderedDict
-from pprint import pformat
+from typing import List, Union
 
-from ludwig.contrib import contrib_command
-from ludwig.data.postprocessing import postprocess
-from ludwig.data.preprocessing import preprocess_for_prediction
-from ludwig.features.feature_registries import output_type_registry
-from ludwig.globals import LUDWIG_VERSION, is_on_master, set_on_master
-from ludwig.globals import TRAIN_SET_METADATA_FILE_NAME
-from ludwig.models.model import load_model_and_definition
-from ludwig.utils.data_utils import save_csv
-from ludwig.utils.data_utils import save_json
-from ludwig.utils.misc import get_from_registry, \
-    find_non_existing_dir_by_adding_suffix
-from ludwig.utils.print_utils import logging_level_registry, repr_ordered_dict
-from ludwig.utils.print_utils import print_boxed
-from ludwig.utils.print_utils import print_ludwig
+import pandas as pd
 
+from ludwig.api import LudwigModel
+from ludwig.constants import FULL, TEST, TRAINING, VALIDATION
+from ludwig.contrib import contrib_command, contrib_import
+from ludwig.globals import LUDWIG_VERSION
+from ludwig.utils.horovod_utils import is_on_master, set_on_master
+from ludwig.utils.print_utils import logging_level_registry, print_ludwig
 
 logger = logging.getLogger(__name__)
 
 
-def full_predict(
-        model_path,
-        data_csv=None,
-        data_hdf5=None,
-        split='test',
-        batch_size=128,
-        skip_save_unprocessed_output=False,
-        skip_save_test_predictions=False,
-        skip_save_test_statistics=False,
-        output_directory='results',
-        evaluate_performance=True,
-        gpus=None,
-        gpu_fraction=1.0,
-        use_horovod=False,
-        debug=False,
+def predict_cli(
+        model_path: str,
+        dataset: Union[str, dict, pd.DataFrame] = None,
+        data_format: str = None,
+        split: str = FULL,
+        batch_size: int = 128,
+        skip_save_unprocessed_output: bool = False,
+        skip_save_predictions: bool = False,
+        output_directory: str = 'results',
+        gpus: Union[str, int, List[int]] = None,
+        gpu_memory_limit: int = None,
+        allow_parallel_threads: bool = True,
+        use_horovod: bool = None,
+        logging_level: int =logging.INFO,
+        debug: bool = False,
         **kwargs
-):
-    if is_on_master():
-        logger.info('Dataset path: {}'.format(
-            data_csv if data_csv is not None else data_hdf5))
-        logger.info('Model path: {}'.format(model_path))
-        logger.info('')
+) -> None:
+    """
+    Loads pre-trained model to make predictions on the provided data set.
 
-    train_set_metadata_json_fp = os.path.join(
+    # Inputs
+
+    :param model_path: (str) filepath to pre-trained model.
+    :param dataset: (Union[str, dict, pandas.DataFrame], default: `None`)
+        source containing the entire dataset to be used in the prediction.
+    :param data_format: (str, default: `None`) format to interpret data
+        sources. Will be inferred automatically if not specified.  Valid
+        formats are `'auto'`, `'csv'`, `'excel'`, `'feather'`,
+        `'fwf'`, `'hdf5'` (cache file produced during previous training),
+        `'html'` (file containing a single HTML `<table>`), `'json'`, `'jsonl'`,
+        `'parquet'`, `'pickle'` (pickled Pandas DataFrame), `'sas'`, `'spss'`,
+        `'stata'`, `'tsv'`.
+    :param split: (str, default: `full`) split on which
+        to perform predictions. Valid values are `'training'`, `'validation'`,
+        `'test'` and `'full'`.
+    :param batch_size: (int, default `128`) size of batches for processing.
+    :param skip_save_unprocessed_output: (bool, default: `False`) by default
+        predictions and their probabilities are saved in both raw
+        unprocessed numpy files containing tensors and as postprocessed
+        CSV files (one for each output feature). If this parameter is True,
+        only the CSV ones are saved and the numpy ones are skipped.
+    :param skip_save_predictions: (bool, default: `False`) skips saving test
+        predictions CSV files
+    :param output_directory: (str, default: `'results'`) the directory that
+        will contain the training statistics, TensorBoard logs, the saved
+        model and the training progress files.
+    :param gpus: (list, default: `None`) list of GPUs that are available
+        for training.
+    :param gpu_memory_limit: (int, default: `None`) maximum memory in MB to
+        allocate per GPU device.
+    :param allow_parallel_threads: (bool, default: `True`) allow TensorFlow
+        to use multithreading parallelism to improve performance at
+        the cost of determinism.
+    :param use_horovod: (bool, default: `None`) flag for using horovod.
+    :param logging_level: (int) Log level that will be sent to stderr.
+    :param debug: (bool, default: `False) if `True` turns on `tfdbg` with
+        `inf_or_nan` checks.
+        **kwargs:
+
+    # Returns
+
+    :return: ('None')
+    """
+    model = LudwigModel.load(
         model_path,
-        TRAIN_SET_METADATA_FILE_NAME
-    )
-
-    # preprocessing
-    dataset, train_set_metadata = preprocess_for_prediction(
-        model_path,
-        split,
-        data_csv,
-        data_hdf5,
-        train_set_metadata_json_fp,
-        evaluate_performance
-    )
-
-    # run the prediction
-    if is_on_master():
-        print_boxed('LOADING MODEL')
-    model, model_definition = load_model_and_definition(model_path,
-                                                        use_horovod=use_horovod)
-
-    prediction_results = predict(
-        dataset,
-        train_set_metadata,
-        model,
-        model_definition,
-        batch_size,
-        evaluate_performance,
-        gpus,
-        gpu_fraction,
-        debug
-    )
-    model.close_session()
-
-    if is_on_master():
-        # setup directories and file names
-        experiment_dir_name = find_non_existing_dir_by_adding_suffix(output_directory)
-
-        # if we are skipping all saving,
-        # there is no need to create a directory that will remain empty
-        should_create_exp_dir = not (
-                skip_save_unprocessed_output and
-                skip_save_test_predictions and
-                skip_save_test_statistics
-        )
-        if should_create_exp_dir:
-                os.makedirs(experiment_dir_name)
-
-        # postprocess
-        postprocessed_output = postprocess(
-            prediction_results,
-            model_definition['output_features'],
-            train_set_metadata,
-            experiment_dir_name,
-            skip_save_unprocessed_output or not is_on_master()
-        )
-
-        if not skip_save_test_predictions:
-            save_prediction_outputs(postprocessed_output, experiment_dir_name)
-
-        if evaluate_performance:
-            print_test_results(prediction_results)
-            if not skip_save_test_statistics:
-                save_test_statistics(prediction_results, experiment_dir_name)
-
-        logger.info('Saved to: {0}'.format(experiment_dir_name))
-
-
-def predict(
-        dataset,
-        train_set_metadata,
-        model,
-        model_definition,
-        batch_size=128,
-        evaluate_performance=True,
-        gpus=None,
-        gpu_fraction=1.0,
-        debug=False
-):
-    """Computes predictions based on the computed model.
-        :param dataset: Dataset containing the data to calculate
-               the predictions from.
-        :type dataset: Dataset
-        :param model: The trained model used to produce the predictions.
-        :type model: Model
-        :param model_definition: The model definition of the model to use
-               for obtaining predictions
-        :type model_definition: Dictionary
-        :param batch_size: The size of batches when computing the predictions.
-        :type batch_size: Integer
-        :param evaluate_performance: If this parameter is False, only the predictions
-               will be returned, if it is True, also performance metrics
-               will be calculated on the predictions. It requires the data
-               to contain also ground truth for the output features, otherwise
-               the metrics cannot be computed.
-        :type evaluate_performance: Bool
-        :type gpus: List
-        :type gpu_fraction: Integer
-        :param debug: If true turns on tfdbg with inf_or_nan checks.
-        :type debug: Boolean
-
-        :returns: A dictionary containing the predictions of each output feature,
-                  alongside with statistics on the quality of those predictions
-                  (if evaluate_performance is True).
-        """
-    if is_on_master():
-        print_boxed('PREDICT')
-    test_stats = model.predict(
-        dataset,
-        batch_size,
-        evaluate_performance=evaluate_performance,
+        logging_level=logging_level,
+        use_horovod=use_horovod,
         gpus=gpus,
-        gpu_fraction=gpu_fraction
+        gpu_memory_limit=gpu_memory_limit,
+        allow_parallel_threads=allow_parallel_threads
     )
-
-    if evaluate_performance:
-        calculate_overall_stats(
-            test_stats,
-            model_definition['output_features'],
-            dataset,
-            train_set_metadata
-        )
-
-    return test_stats
-
-
-def calculate_overall_stats(test_stats, output_features, dataset,
-                            train_set_metadata):
-    for output_feature in output_features:
-        feature = get_from_registry(
-            output_feature['type'],
-            output_type_registry
-        )
-        feature.calculate_overall_stats(
-            test_stats, output_feature, dataset, train_set_metadata
-        )
-
-
-def save_prediction_outputs(
-        postprocessed_output,
-        experiment_dir_name,
-        skip_output_types=None
-):
-    if skip_output_types is None:
-        skip_output_types = set()
-    csv_filename = os.path.join(experiment_dir_name, '{}_{}.csv')
-    for output_field, outputs in postprocessed_output.items():
-        for output_type, values in outputs.items():
-            if output_type not in skip_output_types:
-                save_csv(csv_filename.format(output_field, output_type), values)
-
-
-def save_test_statistics(test_stats, experiment_dir_name):
-    test_stats_fn = os.path.join(
-        experiment_dir_name,
-        'test_statistics.json'
+    model.predict(
+        dataset=dataset,
+        data_format=data_format,
+        split=split,
+        batch_size=batch_size,
+        skip_save_unprocessed_output=skip_save_unprocessed_output,
+        skip_save_predictions=skip_save_predictions,
+        output_directory=output_directory,
+        return_type='dict',
+        debug=debug,
     )
-    save_json(test_stats_fn, test_stats)
-
-
-def print_test_results(test_stats):
-    for output_field, result in test_stats.items():
-        if (output_field != 'combined' or
-                (output_field == 'combined' and len(test_stats) > 2)):
-            logger.info('\n===== {} ====='.format(output_field))
-            for measure in sorted(list(result)):
-                if measure != 'confusion_matrix' and measure != 'roc_curve':
-                    value = result[measure]
-                    if isinstance(value, OrderedDict):
-                        value_repr = repr_ordered_dict(value)
-                    else:
-                        value_repr = pformat(result[measure], indent=2)
-                    logger.info(
-                        '{0}: {1}'.format(
-                            measure,
-                            value_repr
-                        )
-                    )
 
 
 def cli(sys_argv):
@@ -258,33 +126,24 @@ def cli(sys_argv):
     # ---------------
     # Data parameters
     # ---------------
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        '--data_csv',
-        help='input data CSV file. '
-             'If it has a split column, it will be used for splitting '
-             '(0: train, 1: validation, 2: test), '
-             'otherwise the dataset will be randomly split'
-    )
-    group.add_argument(
-        '--data_hdf5',
-        help='input data HDF5 file. It is an intermediate preprocess version of'
-             ' the input CSV created the first time a CSV file is used in the '
-             'same directory with the same name and a hdf5 extension'
+    parser.add_argument(
+        '--dataset',
+        help='input data file path',
+        required=True
     )
     parser.add_argument(
-        '--train_set_metadata_json',
-        help='input metadata JSON file. It is an intermediate preprocess file '
-             'containing the mappings of the input CSV created the first time '
-             'a CSV file is used in the same directory with the same name and '
-             'a json extension'
+        '--data_format',
+        help='format of the input data',
+        default='auto',
+        choices=['auto', 'csv', 'excel', 'feather', 'fwf', 'hdf5',
+                 'html' 'tables', 'json', 'jsonl', 'parquet', 'pickle', 'sas',
+                 'spss', 'stata', 'tsv']
     )
-
     parser.add_argument(
         '-s',
         '--split',
-        default='test',
-        choices=['training', 'validation', 'test', 'full'],
+        default=FULL,
+        choices=[TRAINING, VALIDATION, TEST, FULL],
         help='the split to test the model on'
     )
 
@@ -316,17 +175,10 @@ def cli(sys_argv):
     )
     parser.add_argument(
         '-sstp',
-        '--skip_save_test_predictions',
-        help='skips saving test predictions CSV files',
+        '--skip_save_predictions',
+        help='skips saving predictions CSV files',
         action='store_true', default=False
     )
-    parser.add_argument(
-        '-sstes',
-        '--skip_save_test_statistics',
-        help='skips saving test statistics JSON file',
-        action='store_true', default=False
-    )
-
 
     # ------------------
     # Generic parameters
@@ -350,17 +202,24 @@ def cli(sys_argv):
         help='list of gpu to use'
     )
     parser.add_argument(
-        '-gf',
-        '--gpu_fraction',
-        type=float,
-        default=1.0,
-        help='fraction of gpu memory to initialize the process with'
+        '-gml',
+        '--gpu_memory_limit',
+        type=int,
+        default=None,
+        help='maximum memory in MB to allocate per GPU device'
+    )
+    parser.add_argument(
+        '-dpt',
+        '--disable_parallel_threads',
+        action='store_false',
+        dest='allow_parallel_threads',
+        help='disable TensorFlow from using multithreading for reproducibility'
     )
     parser.add_argument(
         '-uh',
         '--use_horovod',
         action='store_true',
-        default=False,
+        default=None,
         help='uses horovod for distributed training'
     )
     parser.add_argument(
@@ -379,19 +238,26 @@ def cli(sys_argv):
     )
 
     args = parser.parse_args(sys_argv)
-    args.evaluate_performance = False
 
+    args.logging_level = logging_level_registry[args.logging_level]
     logging.getLogger('ludwig').setLevel(
-        logging_level_registry[args.logging_level]
+        args.logging_level
     )
+    global logger
+    logger = logging.getLogger('ludwig.predict')
+
     set_on_master(args.use_horovod)
 
     if is_on_master():
         print_ludwig('Predict', LUDWIG_VERSION)
+        logger.info('Dataset path: {}'.format(args.dataset))
+        logger.info('Model path: {}'.format(args.model_path))
+        logger.info('')
 
-    full_predict(**vars(args))
+    predict_cli(**vars(args))
 
 
 if __name__ == '__main__':
+    contrib_import()
     contrib_command("predict", *sys.argv)
     cli(sys.argv[1:])

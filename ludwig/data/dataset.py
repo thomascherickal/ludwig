@@ -41,7 +41,8 @@ class Dataset:
             idx = range(self.size)
         if (self.data_hdf5_fp is None or
                 'preprocessing' not in self.features[feature_name] or
-                'in_memory' not in self.features[feature_name]['preprocessing']):
+                'in_memory' not in self.features[feature_name][
+                    'preprocessing']):
             return self.dataset[feature_name][idx]
         if self.features[feature_name]['preprocessing']['in_memory']:
             return self.dataset[feature_name][idx]
@@ -62,5 +63,5 @@ class Dataset:
     def get_dataset(self):
         return self.dataset
 
-    def set_dataset(self, dataset):
-        self.dataset = dataset
+    def __len__(self):
+        return self.size
